@@ -1,0 +1,7 @@
+post_install() {
+	echo ':: Move sshd off port 22, then run: systemctl enable --now ssh-kex-tarpit.socket'
+}
+
+post_upgrade() {
+	echo ':: Restart to apply: systemctl restart ssh-kex-tarpit.service'
+}

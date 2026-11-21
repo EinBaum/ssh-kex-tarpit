@@ -1,0 +1,330 @@
+#!/usr/bin/python3 -IuS
+# SSH tarpit posing as OpenSSH: version line, then a KEXINIT trickled one byte per --delay.
+# Never reads from clients. Listening sockets come from systemd socket activation.
+import argparse
+import asyncio
+import collections
+import ipaddress
+import math
+import os
+import random
+import resource
+import select
+import signal
+import socket
+import struct
+
+DEFAULT_VERSION = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20"
+# Declared packet size: <= 35000 (RFC 4253 6.1), multiple of 8 (OpenSSH alignment check).
+PACKET_SIZE = 32768
+# File descriptors kept free for stdio and the event loop.
+FD_RESERVE = 16
+# Seconds after which an address that keeps coming is logged.
+VISIT_MAX = 3600
+# Addresses that wait for their log line, and address lines per --log-after. The rest share one line.
+GONE_MAX = 256
+
+# OpenSSH 9.6p1 defaults with RSA, ECDSA and Ed25519 host keys.
+_CIPHERS = ("chacha20-poly1305@openssh.com,aes128-ctr,aes192-ctr,aes256-ctr,"
+            "aes128-gcm@openssh.com,aes256-gcm@openssh.com")
+_MACS = ("umac-64-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,"
+         "hmac-sha2-512-etm@openssh.com,hmac-sha1-etm@openssh.com,umac-64@openssh.com,"
+         "umac-128@openssh.com,hmac-sha2-256,hmac-sha2-512,hmac-sha1")
+_NAME_LISTS = (
+    "sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,"
+    "ecdh-sha2-nistp256,ecdh-sha2-nistp384,ecdh-sha2-nistp521,diffie-hellman-group-exchange-sha256,"
+    "diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group14-sha256,"
+    "ext-info-s,kex-strict-s-v00@openssh.com",
+    "rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256,ssh-ed25519",
+    _CIPHERS, _CIPHERS, _MACS, _MACS,
+    "none,zlib@openssh.com", "none,zlib@openssh.com",
+    "", "",
+)
+# KEXINIT payload after the cookie: name-lists, first_kex_packet_follows, reserved.
+KEXINIT_TAIL = b"".join(struct.pack(">I", len(n)) + n.encode() for n in _NAME_LISTS) + bytes(5)
+# Padding a real KEXINIT of this payload would have (4 to 11 bytes).
+PADDING = 4 + -(5 + 17 + len(KEXINIT_TAIL) + 4) % 8
+
+
+def kexinit_start():
+    return struct.pack(">IBB", PACKET_SIZE - 4, PADDING, 20) + random.randbytes(16) + KEXINIT_TAIL
+
+
+def fmt(addr):
+    host = addr[0]
+    if host.startswith("::ffff:") and "." in host:
+        host = host[7:]
+    return f"{host} port {addr[1]}"
+
+
+def identify(host):
+    # A peer's address and what --max-per-ip counts for it: the IPv4 address or the IPv6 /64.
+    ip = ipaddress.ip_address(host.partition("%")[0])
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.version == 4:
+        return str(ip), str(ip)
+    return str(ip), str(ipaddress.ip_network((ip, 64), strict=False))
+
+
+def count(n, noun, plural="s"):
+    return f"{n} {noun}{'' if n == 1 else plural}"
+
+
+def span(seconds):
+    m, s = divmod(round(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02}m"
+    if m:
+        return f"{m}m{s:02}s"
+    return f"{s}s"
+
+
+class Visit:
+    # One address's connections that share a log line.
+    __slots__ = ("first", "last", "open", "count", "refused", "held", "longest")
+
+    def __init__(self, now, still_open=0):
+        self.first = self.last = now
+        self.open = still_open
+        self.count = self.refused = 0
+        self.held = self.longest = 0
+
+
+class Tarpit:
+    def __init__(self, version, delay, max_clients, max_per_ip, log_after):
+        self.version = version.encode() + b"\r\n"
+        self.delay = delay
+        self.max_clients = max_clients
+        self.max_per_ip = max_per_ip
+        self.log_after = log_after
+        self.held = {}
+        self.per_source = collections.Counter()
+        self.visits = {}
+        # Visits without an open connection, longest gone first.
+        self.gone = collections.OrderedDict()
+        self.timer = None
+        # Sum of the visits that were past GONE_MAX.
+        self.others = collections.Counter()
+        self.quota = {}
+        self.limit_logged = False
+        self.stopping = False
+        # Reports peers that closed, without reading from them.
+        self.hangups = select.epoll()
+
+    def on_hangup(self):
+        for fd, _ in self.hangups.poll(0):
+            self.hangups.unregister(fd)
+            self.held[fd].cancel()
+
+    def allow(self, kind, limit=1):
+        # True for the first messages of a kind in each --log-after, up to the limit.
+        now = asyncio.get_running_loop().time()
+        until, used = self.quota.get(kind, (0, 0))
+        if now >= until:
+            until, used = now + self.log_after, 0
+        self.quota[kind] = until, used + 1
+        return used < limit
+
+    def log(self, addr, note="", own_line=True):
+        visit = self.visits.pop(addr)
+        self.gone.pop(addr, None)
+        if visit.open:
+            self.visits[addr] = Visit(visit.last, visit.open)
+        if not own_line or not (note or self.allow("address", GONE_MAX)):
+            if not self.others:
+                asyncio.get_running_loop().call_later(self.log_after, self.log_others)
+            self.others.update(addresses=1, connections=visit.count, held=visit.held, refused=visit.refused)
+            return
+        line = f"{addr}: {count(visit.count, 'connection')}"
+        if visit.count == 1:
+            line += f", held {span(visit.held)}"
+        elif visit.count:
+            line += (f" in {span(visit.last - visit.first)}, held {span(visit.held)} in total, "
+                     f"longest {span(visit.longest)}")
+        if visit.refused:
+            line += f", {visit.refused} refused"
+        print(line + note)
+
+    def log_gone(self):
+        loop = asyncio.get_running_loop()
+        self.timer = None
+        while self.gone:
+            addr, visit = next(iter(self.gone.items()))
+            wait = visit.last + self.log_after - loop.time()
+            if wait > 0:
+                self.timer = loop.call_later(wait, self.log_gone)
+                break
+            self.log(addr)
+
+    def log_others(self):
+        o = self.others
+        line = (f"{count(o['addresses'], 'other address', 'es')}: {count(o['connections'], 'connection')}, "
+                f"held {span(o['held'])} in total")
+        if o["refused"]:
+            line += f", {o['refused']} refused"
+        print(line)
+        o.clear()
+
+    def touched(self, addr, visit):
+        # A connection of the visit left or was refused.
+        loop = asyncio.get_running_loop()
+        visit.last = loop.time()
+        if self.stopping:
+            if not visit.open:
+                self.log(addr, " (shutdown)")
+        elif visit.last - visit.first >= VISIT_MAX:
+            self.log(addr)
+        elif not visit.open:
+            self.gone[addr] = visit
+            self.gone.move_to_end(addr)
+            if len(self.gone) > GONE_MAX:
+                self.log(next(iter(self.gone)), own_line=False)
+            if not self.timer:
+                self.timer = loop.call_later(self.log_after, self.log_gone)
+
+    def left(self, addr, src, seconds):
+        self.per_source[src] -= 1
+        if not self.per_source[src]:
+            del self.per_source[src]
+        visit = self.visits[addr]
+        visit.open -= 1
+        visit.count += 1
+        visit.held += seconds
+        visit.longest = max(visit.longest, seconds)
+        self.touched(addr, visit)
+
+    async def trap(self, conn, addr, src):
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        try:
+            self.hangups.register(conn, select.EPOLLRDHUP)
+            await loop.sock_sendall(conn, self.version)
+            packet = kexinit_start()
+            for i in range(PACKET_SIZE):
+                await asyncio.sleep(self.delay)
+                await loop.sock_sendall(conn, packet[i:i + 1] or random.randbytes(1))
+        except OSError:
+            pass
+        finally:
+            del self.held[conn.fileno()]
+            conn.close()
+            self.left(addr, src, loop.time() - start)
+
+    async def serve(self, listener):
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                conn, peer = await loop.sock_accept(listener)
+            except ConnectionAbortedError:
+                continue
+            except OSError as e:
+                if self.allow("accept"):
+                    print(f"accept failed: {e.strerror}")
+                await asyncio.sleep(1)
+                continue
+            if len(self.held) >= self.max_clients:
+                conn.close()
+                if not self.limit_logged:
+                    self.limit_logged = True
+                    if self.allow("full"):
+                        print(f"{self.max_clients} clients held, closing new connections until one leaves")
+                continue
+            self.limit_logged = False
+            addr, src = identify(peer[0])
+            visit = self.visits.get(addr)
+            if not visit:
+                visit = self.visits[addr] = Visit(loop.time())
+            if self.per_source[src] >= self.max_per_ip:
+                conn.close()
+                if not visit.refused and self.allow("per-ip"):
+                    print(f"{src} holds {self.max_per_ip} connections, closing its new ones until one leaves")
+                visit.refused += 1
+                self.touched(addr, visit)
+                continue
+            self.gone.pop(addr, None)
+            visit.open += 1
+            self.per_source[src] += 1
+            self.held[conn.fileno()] = asyncio.create_task(self.trap(conn, addr, src))
+
+    async def run(self, socks):
+        loop = asyncio.get_running_loop()
+        loop.add_reader(self.hangups.fileno(), self.on_hangup)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, asyncio.current_task().cancel)
+        try:
+            await asyncio.gather(*(self.serve(s) for s in socks))
+        finally:
+            self.stopping = True
+            for addr in list(self.gone):
+                self.log(addr)
+            if self.others:
+                self.log_others()
+
+
+def passed_sockets():
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        raise SystemExit("no listening sockets passed, start ssh-kex-tarpit.socket "
+                         "or test with: systemd-socket-activate -l 2222 ./ssh-kex-tarpit")
+    socks = [socket.socket(fileno=3 + i) for i in range(int(os.environ["LISTEN_FDS"]))]
+    for s in socks:
+        s.setblocking(False)
+    return socks
+
+
+def version_line(s):
+    if not s.startswith("SSH-2.0-") or len(s) > 253 or not all(" " <= c <= "~" for c in s):
+        raise argparse.ArgumentTypeError("needs the SSH-2.0- prefix, printable ASCII, at most 253 characters")
+    return s
+
+
+def positive(cast):
+    def parse(s):
+        v = cast(s)
+        if not (v > 0 and math.isfinite(v)):
+            raise argparse.ArgumentTypeError(f"must be a positive number: {s}")
+        return v
+    parse.__name__ = cast.__name__
+    return parse
+
+
+def seconds(s):
+    v = float(s)
+    if not (v >= 0 and math.isfinite(v)):
+        raise argparse.ArgumentTypeError(f"must be zero or a positive number: {s}")
+    return v
+
+
+def main():
+    p = argparse.ArgumentParser(description="SSH tarpit posing as OpenSSH. "
+                                "Takes its listening sockets from systemd socket activation.")
+    p.add_argument("--version-line", type=version_line, default=DEFAULT_VERSION,
+                   help="identification string to send (default: %(default)s)")
+    p.add_argument("--delay", type=positive(float), default=2.0,
+                   help="seconds between bytes (default: %(default)s)")
+    p.add_argument("--max-clients", type=positive(int), default=4096,
+                   help="connections held at once, capped by the open file limit (default: %(default)s)")
+    p.add_argument("--max-per-ip", type=positive(int), default=32,
+                   help="connections held per IPv4 address or IPv6 /64 (default: %(default)s)")
+    p.add_argument("--log-after", type=seconds, default=600.0,
+                   help="seconds an address is gone before its line is logged (default: %(default)s)")
+    args = p.parse_args()
+    socks = passed_sockets()
+    nofile = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    room = nofile - len(socks) - FD_RESERVE
+    if room < 1:
+        raise SystemExit(f"open file limit {nofile} is too low")
+    if args.max_clients > room:
+        print(f"open file limit {nofile} leaves room for {room} clients, not --max-clients {args.max_clients}")
+        args.max_clients = room
+    print("listening on " + ", ".join(fmt(s.getsockname()) for s in socks))
+    try:
+        asyncio.run(Tarpit(args.version_line, args.delay, args.max_clients, args.max_per_ip,
+                           args.log_after).run(socks))
+    except asyncio.CancelledError:
+        pass
+
+
+if __name__ == "__main__":
+    main()

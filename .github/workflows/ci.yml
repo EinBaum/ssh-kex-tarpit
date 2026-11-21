@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck pyflakes3
+      - name: Lint
+        run: |
+          shellcheck test/*.sh
+          pyflakes3 ssh-kex-tarpit test/sandbox-probe.py
+      - name: Tests
+        run: test/run-tests.sh
+      - name: System tests
+        run: sudo test/system-tests.sh
+
+  python-3-9:
+    runs-on: ubuntu-24.04
+    container: python:3.9-slim-bookworm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install tools
+        run: apt-get update && apt-get install -y --no-install-recommends openssh-client systemd
+      - name: Tests
+        run: PYTHON=python3.9 test/run-tests.sh
+
+  arch-package:
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install tools
+        run: pacman -Syu --noconfirm python openssh
+      - name: Build package
+        run: |
+          useradd -m builder
+          chown -R builder .
+          su builder -c 'cd arch && makepkg -f'
+      - name: Install package
+        run: |
+          pacman -U --noconfirm arch/ssh-kex-tarpit-*.pkg.tar.zst
+          pacman -Qk ssh-kex-tarpit
+          systemd-analyze verify /usr/lib/systemd/system/ssh-kex-tarpit.socket /usr/lib/systemd/system/ssh-kex-tarpit.service
+      - name: Tests
+        run: su builder -c test/run-tests.sh

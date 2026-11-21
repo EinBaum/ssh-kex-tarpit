@@ -1,0 +1,13 @@
+[Unit]
+Description=ssh-kex-tarpit listening socket
+
+[Socket]
+ListenStream=22
+BindIPv6Only=both
+# Never read, but a client's KEXINIT must fit or its FIN stays queued behind it.
+ReceiveBuffer=4096
+# One byte is sent at a time.
+SendBuffer=1
+
+[Install]
+WantedBy=sockets.target

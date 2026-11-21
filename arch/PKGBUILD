@@ -1,0 +1,27 @@
+# Maintainer: EinBaum <mail@einbaum.org>
+pkgname=ssh-kex-tarpit
+pkgver=0.3.2
+pkgrel=1
+pkgdesc='SSH tarpit posing as OpenSSH that stalls bots in the key exchange'
+arch=('any')
+url='https://github.com/einbaum/ssh-kex-tarpit'
+license=('MIT')
+depends=('python' 'systemd')
+install=ssh-kex-tarpit.install
+
+# Builds from the checkout this PKGBUILD is in.
+check() {
+	cd "$startdir/.."
+	python -IS ssh-kex-tarpit --help > /dev/null
+}
+
+package() {
+	cd "$startdir/.."
+	install -Dm755 ssh-kex-tarpit "$pkgdir/usr/bin/ssh-kex-tarpit"
+	install -Dm644 -t "$pkgdir/usr/lib/systemd/system" systemd/ssh-kex-tarpit.socket systemd/ssh-kex-tarpit.service
+	install -d "$pkgdir/usr/share/$pkgname/root/"{bin,dev,etc,lib,lib64,proc,root,run,sbin,sys,tmp,usr,var/tmp}
+	install -Dm755 test/sandbox-probe.sh "$pkgdir/usr/share/$pkgname/sandbox-probe.sh"
+	install -Dm644 test/sandbox-probe.py "$pkgdir/usr/share/$pkgname/sandbox-probe.py"
+	install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
