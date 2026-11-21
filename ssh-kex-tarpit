@@ -14,6 +14,7 @@ import signal
 import socket
 import struct
 
+RELEASE = "0.3.3"
 DEFAULT_VERSION = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20"
 # Declared packet size: <= 35000 (RFC 4253 6.1), multiple of 8 (OpenSSH alignment check).
 PACKET_SIZE = 32768
@@ -309,6 +310,7 @@ def main():
                    help="connections held per IPv4 address or IPv6 /64 (default: %(default)s)")
     p.add_argument("--log-after", type=seconds, default=600.0,
                    help="seconds an address is gone before its line is logged (default: %(default)s)")
+    p.add_argument("--version", action="version", version=f"ssh-kex-tarpit {RELEASE}")
     args = p.parse_args()
     socks = passed_sockets()
     nofile = resource.getrlimit(resource.RLIMIT_NOFILE)[0]

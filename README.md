@@ -59,6 +59,7 @@ sudo systemctl enable --now ssh-kex-tarpit.socket
 --max-clients   default: 4096, capped below LimitNOFILE
 --max-per-ip    per IPv4 address or IPv6 /64, default: 32
 --log-after     seconds an address is gone before its line is logged, default: 600
+--version       print the release and exit
 ```
 
 Set them with `sudo systemctl edit ssh-kex-tarpit.service`:
@@ -66,8 +67,10 @@ Set them with `sudo systemctl edit ssh-kex-tarpit.service`:
 ```
 [Service]
 ExecStart=
-ExecStart=/usr/bin/ssh-kex-tarpit --delay 5
+ExecStart=/usr/bin/ssh-kex-tarpit --delay 5 --version-line "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5"
 ```
+
+Quote a value that contains spaces.
 
 Port: override `ListenStream=` in `ssh-kex-tarpit.socket` the same way.
 
