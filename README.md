@@ -30,7 +30,7 @@ Requires systemd 248+ and Python 3.9+.
 Move sshd off port 22 first.
 
 ```
-git clone https://github.com/einbaum/ssh-kex-tarpit.git
+git clone https://github.com/EinBaum/ssh-kex-tarpit.git
 cd ssh-kex-tarpit
 ```
 
