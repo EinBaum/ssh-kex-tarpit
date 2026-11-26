@@ -21,7 +21,8 @@ debug1: SSH2_MSG_KEXINIT sent
 ## Security
 
 - Never reads client data.
-- Runs without capabilities or network access and sees only `/usr`, read-only.
+- Runs without capabilities and sees only `/usr`, read-only.
+- Its only network access is the listening socket from systemd. It can accept clients there, but it can't open connections.
 - Limited to 4096 clients, 32 per IP, 128 MB of memory and 25% CPU.
 
 Requires systemd 248+ and Python 3.9+.

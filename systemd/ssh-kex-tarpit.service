@@ -47,6 +47,9 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# The sockets from the .socket unit are in the host's network namespace.
+# connect, shutdown and io_uring (in @aio) could reuse them for outgoing connections.
+SystemCallFilter=~@aio @keyring @memlock connect shutdown
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 AmbientCapabilities=

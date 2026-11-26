@@ -1,6 +1,6 @@
 # Maintainer: EinBaum <mail@einbaum.org>
 pkgname=ssh-kex-tarpit
-pkgver=0.4.0
+pkgver=0.4.1
 pkgrel=1
 pkgdesc='SSH tarpit posing as OpenSSH that stalls bots in the key exchange'
 arch=('any')

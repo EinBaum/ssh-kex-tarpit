@@ -14,7 +14,7 @@ import signal
 import socket
 import struct
 
-RELEASE = "0.4.0"
+RELEASE = "0.4.1"
 DEFAULT_VERSION = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20"
 # Declared packet size: <= 35000 (RFC 4253 6.1), multiple of 8 (OpenSSH alignment check).
 PACKET_SIZE = 32768
